@@ -1,0 +1,17 @@
+# Ultra-Fast Large File Support (1+ lakh rows)
+pandas==2.1.4
+numpy==1.25.2
+openpyxl==3.1.2
+pyxlsb==1.0.10
+chardet==5.2.0
+
+# Original dependencies
+psycopg[binary]==3.1.18
+python-dotenv==1.0.0
+PyYAML==6.0.1
+deepdiff==7.0.1
+matplotlib==3.8.2
+pytest==7.4.3
+
+# Performance optimization
+orjson==3.9.10

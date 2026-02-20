@@ -1,0 +1,18 @@
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+DEFAULT_COL_WIDTHS = {"CfgKey":200, "Type":120, "Key":380, "Old":360, "New":360}
+@dataclass(frozen=True)
+class UIConfig:
+    font_default: tuple[str,int] = ("Segoe UI", 10)
+    font_mono: tuple[str,int] = ("Courier New", 9)
+    bg_main: str = "#f5f6f7"
+    bg_changed: str = "#fff4cc"
+    bg_added: str = "#d9fdd3"
+    bg_removed: str = "#ffd6d6"
+    json_hit_bg: str = "#ffe24a"
+    json_hit_fg: str = "#000000"
+    min_width: int = 1280
+    min_height: int = 800
+    col_widths: dict[str,int] = field(default_factory=lambda: DEFAULT_COL_WIDTHS.copy())
+CONFIG = UIConfig()

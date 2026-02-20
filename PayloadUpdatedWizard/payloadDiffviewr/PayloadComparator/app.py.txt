@@ -1,0 +1,1240 @@
+from __future__ import annotations
+
+import os
+import re
+import csv
+import json
+import difflib
+import threading
+import queue
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple, Optional, Iterable, Callable
+from decimal import Decimal, InvalidOperation, localcontext
+
+# Tk
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import font as tkfont
+
+# Project modules
+from .parse_logger import ParseLogger
+from .ui_config import UIConfig
+from .file_loader import FileLoader, detect_best_columns, assemble_rows, NEEDED_ROLES
+from .json_utils import (
+    parse_jsonish_verbose,
+    pretty_json,
+    dd_path_to_key,
+    build_fragment_from_path_value,
+)
+from .settings import SettingsManager
+from .sharepoint import sharepoint_url_to_unc
+
+# DeepDiff
+try:
+    from deepdiff import DeepDiff
+    _HAVE_DD = True
+except Exception:
+    _HAVE_DD = False
+
+# Matplotlib (optional for Summary) — OO API only (no pyplot)
+_HAVE_MPL = False
+try:
+    import matplotlib
+    matplotlib.use("TkAgg")
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    _HAVE_MPL = True
+except Exception:
+    _HAVE_MPL = False
+
+INLINE_ROWS = getattr(UIConfig, "INLINE_ROWS", 8)
+
+# Accept only alphabetic + underscore config names
+CFG_NAME_RE = re.compile(r"^[A-Za-z_]+$")
+SCI_RE = re.compile(r'^[+-]?(?:\d+\.?\d*|\d*\.?\d+)[eE][+-]?\d+$')  # matches "5.37126e+18" style
+
+
+def _de_sci_str(s: str) -> str:
+    """
+    Convert a number string in scientific notation to non-exponent form
+    using Decimal for precision. Trim trailing zeros and a dangling dot.
+    If the string isn't in scientific notation, return it unchanged.
+    """
+    t = (s or "").strip()
+    if not t or not SCI_RE.match(t):
+        return t
+    try:
+        with localcontext() as ctx:
+            # plenty of precision so we don't round off big integers
+            ctx.prec = max(80, len(t) * 2)
+            d = Decimal(t)
+            as_str = format(d, "f")
+        if "." in as_str:
+            as_str = as_str.rstrip("0").rstrip(".")
+        return as_str
+    except InvalidOperation:
+        return t
+
+
+def _maybe_int_from_float_str(fl: float) -> Optional[int]:
+    """
+    If a float string looks like an integer (after removing exponent),
+    return it as an int; otherwise None.
+    """
+    try:
+        s = _de_sci_str(str(fl))
+        if s and ("." not in s) and ("e" not in s.lower()):
+            return int(s)
+        # also handle "1234.0"
+        if s.endswith(".0") and s[:-2].isdigit():
+            return int(s[:-2])
+    except Exception:
+        pass
+    return None
+
+
+def sanitize_numbers_for_display(obj: Any) -> Any:
+    """
+    Recursively walk an object and:
+      - convert floats that are integer-like or exponent-like into Python ints
+      - leave real non-integer floats alone
+      - convert strings like "5.37e+18" -> "5370000000000000000"
+    This keeps JSON panes readable without scientific notation.
+    """
+    if isinstance(obj, dict):
+        return {k: sanitize_numbers_for_display(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_numbers_for_display(v) for v in obj]
+    if isinstance(obj, float):
+        maybe = _maybe_int_from_float_str(obj)
+        return maybe if maybe is not None else obj
+    if isinstance(obj, str):
+        # only "de-sci" for strings; keep as string to avoid changing semantics
+        return _de_sci_str(obj)
+    return obj
+
+
+@dataclass
+class RowMeta:
+    cfgkey: str
+    typ: str
+    path: str
+    old: Any
+    new: Any
+    old_obj: Any
+    new_obj: Any
+
+
+class SyncedTextPair:
+    """Synchronize vertical scrolling between two Text widgets."""
+    def __init__(self, left_text: tk.Text, right_text: tk.Text,
+                 left_scroll: Optional[ttk.Scrollbar] = None,
+                 right_scroll: Optional[ttk.Scrollbar] = None) -> None:
+        self.left = left_text
+        self.right = right_text
+        self.left_scroll = left_scroll
+        self.right_scroll = right_scroll
+        self._lock = False
+
+        self.left.configure(yscrollcommand=self._on_left_yscroll)
+        self.right.configure(yscrollcommand=self._on_right_yscroll)
+
+        if self.left_scroll is not None:
+            self.left_scroll.configure(command=self._on_left_scrollbar)
+        if self.right_scroll is not None:
+            self.right_scroll.configure(command=self._on_right_scrollbar)
+
+        for w in (self.left, self.right):
+            w.bind("<MouseWheel>", self._on_mousewheel, add=True)
+
+    def _on_left_yscroll(self, first: str, last: str) -> None:
+        if self._lock:
+            return
+        try:
+            self._lock = True
+            self.right.yview_moveto(first)
+            if self.left_scroll:
+                self.left_scroll.set(first, last)
+            if self.right_scroll:
+                self.right_scroll.set(first, last)
+        finally:
+            self._lock = False
+
+    def _on_right_yscroll(self, first: str, last: str) -> None:
+        if self._lock:
+            return
+        try:
+            self._lock = True
+            self.left.yview_moveto(first)
+            if self.left_scroll:
+                self.left_scroll.set(first, last)
+            if self.right_scroll:
+                self.right_scroll.set(first, last)
+        finally:
+            self._lock = False
+
+    def _on_left_scrollbar(self, *args: str) -> None:
+        if self._lock:
+            return
+        try:
+            self._lock = True
+            self.left.yview(*args)
+            first, last = self.left.yview()
+            self.right.yview_moveto(first)
+            if self.left_scroll:
+                self.left_scroll.set(first, last)
+            if self.right_scroll:
+                self.right_scroll.set(first, last)
+        finally:
+            self._lock = False
+
+    def _on_right_scrollbar(self, *args: str) -> None:
+        if self._lock:
+            return
+        try:
+            self._lock = True
+            self.right.yview(*args)
+            first, last = self.right.yview()
+            self.left.yview_moveto(first)
+            if self.left_scroll:
+                self.left_scroll.set(first, last)
+            if self.right_scroll:
+                self.right_scroll.set(first, last)
+        finally:
+            self._lock = False
+
+    def _on_mousewheel(self, event: tk.Event) -> str:
+        delta = int(-1 * (event.delta / 120))
+        self.left.yview_scroll(delta, "units")
+        first, last = self.left.yview()
+        self.right.yview_moveto(first)
+        if self.left_scroll:
+            self.left_scroll.set(first, last)
+        if self.right_scroll:
+            self.right_scroll.set(first, last)
+        return "break"
+
+
+class App(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("Payload Diff Viewer (Config Name -> Current vs Old)")
+        self.geometry(f"{UIConfig.WINDOW_W}x{UIConfig.WINDOW_H}")
+        self.minsize(UIConfig.MIN_W, UIConfig.MIN_H)
+
+        self.rows: List[Dict[str, str]] = []
+        self.by_name: Dict[str, List[Dict[str, str]]] = {}
+        self.parse_logger = ParseLogger()
+        self.loader = FileLoader(self.parse_logger)
+        self.settings = SettingsManager()
+        self._last_open_dir: Optional[str] = None
+
+        self.watchlist: List[str] = []
+        self.only_watch = tk.BooleanVar(value=False)
+        self.arrays_as_sets = tk.BooleanVar(value=False)
+        self.search_var = tk.StringVar()
+
+        self._tree_meta: Dict[str, RowMeta] = {}
+
+        self._build_ui()
+        self._bind_shortcuts()
+
+    def _build_ui(self) -> None:
+        menubar = tk.Menu(self)
+
+        filemenu = tk.Menu(menubar, tearoff=0)
+        filemenu.add_command(label="Open… (Ctrl+O)", command=self.on_open)
+        filemenu.add_command(label="Set Default Folder…", command=self.on_set_default_folder)
+        filemenu.add_command(label="Set Default from SharePoint URL…", command=self._set_default_from_sp_url)
+        filemenu.add_separator()
+        filemenu.add_command(label="Export CSV (Ctrl+S)", command=self.on_export_csv)
+        filemenu.add_command(label="Export TXT (Ctrl+E)", command=self.on_export_txt)
+        filemenu.add_separator()
+        filemenu.add_command(label="Exit", command=self.destroy)
+        menubar.add_cascade(label="File", menu=filemenu)
+
+        viewmenu = tk.Menu(menubar, tearoff=0)
+        viewmenu.add_command(label="Summary (Ctrl+M)", command=self.on_view_summary)
+        menubar.add_cascade(label="View", menu=viewmenu)
+
+        helpmenu = tk.Menu(menubar, tearoff=0)
+        helpmenu.add_command(label="Show Parse Log", command=lambda: self.parse_logger.show(self))
+        helpmenu.add_separator()
+        helpmenu.add_command(label="Keyboard Shortcuts", command=self.show_shortcuts_help)
+        menubar.add_cascade(label="Help", menu=helpmenu)
+
+        self.config(menu=menubar)
+
+        # Top controls
+        top = ttk.Frame(self)
+        top.pack(fill=tk.X, padx=10, pady=8)
+
+        ttk.Button(top, text='Open…', command=self.on_open).pack(side=tk.LEFT)
+
+        ttk.Label(top, text='Config Name:').pack(side=tk.LEFT, padx=(12, 4))
+        self.cmb_name = ttk.Combobox(top, state='disabled', width=36)
+        self.cmb_name.pack(side=tk.LEFT)
+        self.cmb_name.bind('<<ComboboxSelected>>', self.on_name_selected)
+
+        ttk.Label(top, text='Config Keys:').pack(side=tk.LEFT, padx=(12, 4))
+        self.lst_keys = tk.Listbox(top, selectmode=tk.EXTENDED, width=38, height=6, exportselection=False)
+        self.lst_keys.pack(side=tk.LEFT)
+        self.lst_keys.configure(state=tk.DISABLED)
+
+        btn_frame = ttk.Frame(top)
+        btn_frame.pack(side=tk.LEFT, padx=(12, 0), fill=tk.Y)
+        self.btn_compare = ttk.Button(btn_frame, text='Compare (F5)', state='disabled', command=self.on_compare)
+        self.btn_compare.pack(pady=(0, 2))
+        self.btn_clear = ttk.Button(btn_frame, text='Clear Results', state='disabled', command=self._reset_views)
+        self.btn_clear.pack()
+
+        self.btn_export_csv = ttk.Button(top, text='Export CSV', state='disabled', command=self.on_export_csv)
+        self.btn_export_csv.pack(side=tk.LEFT, padx=(6, 0))
+        self.btn_export_txt = ttk.Button(top, text='Export TXT', state='disabled', command=self.on_export_txt)
+        self.btn_export_txt.pack(side=tk.LEFT, padx=(6, 0))
+
+        self.lbl = ttk.Label(self, text='Open a CSV/Excel file to begin.')
+        self.lbl.pack(anchor='w', padx=12)
+
+        # Options row
+        opt = ttk.Frame(self)
+        opt.pack(fill=tk.X, padx=10, pady=(2, 6))
+        ttk.Label(opt, text='Arrays:').pack(side=tk.LEFT)
+        ttk.Radiobutton(opt, text='by index', variable=self.arrays_as_sets, value=False, command=self.on_compare).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Radiobutton(opt, text='as set (ignore order)', variable=self.arrays_as_sets, value=True, command=self.on_compare).pack(side=tk.LEFT)
+
+        ttk.Label(opt, text='  Watch keys:').pack(side=tk.LEFT, padx=(14, 4))
+        self.ent_watch = ttk.Entry(opt, width=64)
+        self.ent_watch.pack(side=tk.LEFT)
+        self.ent_watch.insert(0, UIConfig.DEFAULT_WATCHLIST)
+        ttk.Checkbutton(opt, text='Only watch', variable=self.only_watch, command=self._filter_tree).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(opt, text='Apply', command=self.apply_watchlist).pack(side=tk.LEFT, padx=(8, 0))
+
+        # Filter row + counts
+        flt = ttk.Frame(self)
+        flt.pack(fill=tk.X, padx=10, pady=(0, 6))
+        ttk.Label(flt, text='Filter:').pack(side=tk.LEFT)
+        self.filter_entry = ttk.Entry(flt, textvariable=self.search_var, width=40)
+        self.filter_entry.pack(side=tk.LEFT, padx=8)
+        ttk.Button(flt, text='Clear', command=lambda: self.search_var.set('')).pack(side=tk.LEFT)
+        self.search_var.trace_add('write', lambda *_: self._filter_tree())
+
+        self.v_changed = tk.StringVar(value='Changed: 0')
+        self.v_added = tk.StringVar(value='Added: 0')
+        self.v_removed = tk.StringVar(value='Removed: 0')
+        ttk.Label(flt, textvariable=self.v_changed, foreground='#7a5a00').pack(side=tk.LEFT, padx=(20, 12))
+        ttk.Label(flt, textvariable=self.v_added, foreground='#096b00').pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(flt, textvariable=self.v_removed, foreground='#a00000').pack(side=tk.LEFT)
+
+        # Diff table
+        ftable = ttk.Frame(self)
+        ftable.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 8))
+        self.tree = ttk.Treeview(ftable, columns=UIConfig.TREE_COLUMNS, show='headings', selectmode='browse')
+        for c in UIConfig.TREE_COLUMNS:
+            self.tree.heading(c, text=c)
+            self.tree.column(c, width=UIConfig.TREE_WIDTHS[c], anchor='w')
+        vsb = ttk.Scrollbar(ftable, orient='vertical', command=self.tree.yview)
+        hsb = ttk.Scrollbar(ftable, orient='horizontal', command=self.tree.xview)
+        self.tree.configure(yscroll=vsb.set, xscroll=hsb.set)
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        hsb.grid(row=1, column=0, sticky='ew')
+        ftable.rowconfigure(0, weight=1)
+        ftable.columnconfigure(0, weight=1)
+
+        self.tree.tag_configure('changed', background=UIConfig.COLOR_CHANGED)
+        self.tree.tag_configure('added', background=UIConfig.COLOR_ADDED)
+        self.tree.tag_configure('removed', background=UIConfig.COLOR_REMOVED)
+
+        default_font = tkfont.nametofont("TkDefaultFont")
+        bold_font = tkfont.Font(**default_font.configure())
+        bold_font.configure(weight='bold')
+        self.tree.tag_configure('watch', foreground='#0b5bb5', font=bold_font)
+        self.tree.bind('<<TreeviewSelect>>', self.on_tree_select)
+
+        # Lower panes
+        paned = ttk.PanedWindow(self, orient=tk.VERTICAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        # Inline diff
+        fmid = ttk.LabelFrame(paned, text='Selected Field - Inline Diff')
+        paned.add(fmid, weight=1)
+        left = ttk.Frame(fmid); left.grid(row=1, column=0, sticky='nsew', padx=(0, 6))
+        right = ttk.Frame(fmid); right.grid(row=1, column=1, sticky='nsew', padx=(6, 0))
+        fmid.columnconfigure(0, weight=1); fmid.columnconfigure(1, weight=1); fmid.rowconfigure(1, weight=1)
+
+        ttk.Label(left, text='OLD').pack(anchor='w')
+        self.txt_sel_old = tk.Text(left, wrap='word', height=INLINE_ROWS, font=("Courier New", 9))
+        self.txt_sel_old.pack(fill=tk.BOTH, expand=True)
+        self.txt_sel_old.tag_configure('del', background='#ffcccc')
+
+        ttk.Label(right, text='CURRENT').pack(anchor='w')
+        self.txt_sel_new = tk.Text(right, wrap='word', height=INLINE_ROWS, font=("Courier New", 9))
+        self.txt_sel_new.pack(fill=tk.BOTH, expand=True)
+        self.txt_sel_new.tag_configure('add', background='#c2f0c2')
+
+        # Full JSON panes
+        fbot = ttk.Frame(paned); paned.add(fbot, weight=2)
+        jl = ttk.LabelFrame(fbot, text='OLD Payload (Full JSON)'); jl.grid(row=0, column=0, sticky='nsew', padx=(0, 5))
+        jr = ttk.LabelFrame(fbot, text='CURRENT Payload (Full JSON)'); jr.grid(row=0, column=1, sticky='nsew', padx=(5, 0))
+        fbot.columnconfigure(0, weight=1); fbot.columnconfigure(1, weight=1); fbot.rowconfigure(0, weight=1)
+
+        self.txt_old = tk.Text(jl, wrap='none', font=("Courier New", 9))
+        sc1y = ttk.Scrollbar(jl, orient='vertical')
+        sc1x = ttk.Scrollbar(jl, orient='horizontal', command=self.txt_old.xview)
+        self.txt_old.configure(xscrollcommand=sc1x.set)
+        self.txt_old.pack(fill=tk.BOTH, expand=True)
+        sc1y.pack(side=tk.RIGHT, fill=tk.Y)
+        sc1x.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self.txt_cur = tk.Text(jr, wrap='none', font=("Courier New", 9))
+        sc2y = ttk.Scrollbar(jr, orient='vertical')
+        sc2x = ttk.Scrollbar(jr, orient='horizontal', command=self.txt_cur.xview)
+        self.txt_cur.configure(xscrollcommand=sc2x.set)
+        self.txt_cur.pack(fill=tk.BOTH, expand=True)
+        sc2y.pack(side=tk.RIGHT, fill=tk.Y)
+        sc2x.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self.sync_pair = SyncedTextPair(self.txt_old, self.txt_cur, sc1y, sc2y)
+
+    def _bind_shortcuts(self) -> None:
+        self.bind_all('<Control-o>', lambda e: self.on_open())
+        self.bind_all('<Control-s>', lambda e: self.on_export_csv())
+        self.bind_all('<Control-e>', lambda e: self.on_export_txt())
+        self.bind_all('<Control-f>', lambda e: (self.filter_entry.focus_set(), self.filter_entry.select_range(0, tk.END)))
+        self.bind_all('<Control-m>', lambda e: self.on_view_summary())
+        self.bind_all('<F5>', lambda e: self.on_compare())
+        self.bind_all('<Escape>', lambda e: self.focus_set())
+
+    # ---------------- File Open ----------------
+    def on_open(self) -> None:
+        initial = self._get_initial_open_dir()
+        p = filedialog.askopenfilename(
+            title="Select CSV/TSV/TXT/XLSX/XLS",
+            initialdir=(initial or os.getcwd()),
+            filetypes=[
+                ("All supported", "*.csv *.tsv *.txt *.xlsx *.xls"),
+                ("Excel", "*.xlsx *.xls"),
+                ("CSV/TSV/TXT", "*.csv *.tsv *.txt"),
+                ("All files", "*.*"),
+            ]
+        )
+        if not p:
+            return
+
+        ok, why = self.loader.validate_file(p)
+        if not ok:
+            messagebox.showerror("File Error", why)
+            return
+        self._last_open_dir = os.path.dirname(p)
+
+        ext = os.path.splitext(p)[1].lower()
+        is_csv_like = ext in ('.csv', '.tsv', '.txt')
+        is_excel = ext in ('.xlsx', '.xls')
+
+        def load_task(progress_cb=None):
+            if is_csv_like:
+                return self.loader.load_chunked(p, progress_cb=progress_cb)
+            elif is_excel:
+                return self.loader.load_excel_streaming(p, progress_cb=progress_cb)
+            raise ValueError("Unsupported file type should have been caught earlier.")
+
+        def on_loaded(result):
+            headers, raw_rows = result
+            if not headers or not raw_rows:
+                messagebox.showwarning('No Data', 'File appears to be empty or has no data rows.')
+                return
+
+            mapping, conf = detect_best_columns(headers)
+            missing = [r for r in NEEDED_ROLES if r not in mapping]
+            if missing:
+                mapping2 = self._confirm_column_mapping(headers, mapping, conf)
+                if not mapping2:
+                    messagebox.showinfo("Cancelled", "Column mapping was not confirmed.")
+                    return
+                mapping = mapping2
+
+            self.rows = assemble_rows(headers, raw_rows, mapping)
+            self._finalize_load()
+
+        self._with_progress_threaded(
+            load_task,
+            title="Loading file...",
+            done_cb=on_loaded,
+            determinate=True
+        )
+
+    def _normalize_cfg_name(self, s: str) -> str:
+        return re.sub(r"\s+", "_", (s or "").strip())
+
+    def _normalize_cfg_key(self, v: Any) -> str:
+        """
+        Normalize the Config Key to a user-friendly string:
+          - Always a string
+          - No scientific notation
+        """
+        if v is None:
+            return ""
+        s = str(v).strip()
+        if SCI_RE.match(s):
+            return _de_sci_str(s)
+        # Also fix float-like strings ending with '.0'
+        if s.endswith(".0") and s[:-2].isdigit():
+            return s[:-2]
+        return s
+
+    def _finalize_load(self) -> None:
+        self.by_name.clear()
+        dropped = 0
+        filtered_rows: List[Dict[str, str]] = []
+        for r in self.rows:
+            # Normalize Config Name
+            raw = r.get('Config Name') or ''
+            nm = self._normalize_cfg_name(raw)
+            if nm and CFG_NAME_RE.fullmatch(nm):
+                r['Config Name'] = nm
+                # Normalize Config Key as well (remove sci-notation)
+                r['Config Key'] = self._normalize_cfg_key(r.get('Config Key'))
+                filtered_rows.append(r)
+            else:
+                dropped += 1
+
+        self.rows = filtered_rows
+        if dropped:
+            self.parse_logger.log(
+                f"Filtered out {dropped} row(s) with invalid Config Name (only letters + underscores allowed).",
+                level="warning"
+            )
+
+        for r in self.rows:
+            nm = r['Config Name']
+            self.by_name.setdefault(nm, []).append(r)
+
+        names = sorted(self.by_name.keys())
+        self.cmb_name.configure(state='readonly', values=names)
+        self.cmb_name.set('')
+        self.lst_keys.delete(0, tk.END)
+        self.lst_keys.configure(state=tk.DISABLED)
+
+        self.btn_compare.configure(state='disabled')
+        self.btn_clear.configure(state='disabled')
+        self.btn_export_csv.configure(state='disabled')
+        self.btn_export_txt.configure(state='disabled')
+
+        self.lbl.configure(text=f"Loaded {len(self.rows):,} valid rows. Select a Config Name to begin.")
+        self._reset_views()
+
+    def on_name_selected(self, _evt=None) -> None:
+        n = self.cmb_name.get().strip()
+        self._reset_views()
+        self.btn_compare.configure(state='disabled')
+
+        self.lst_keys.delete(0, tk.END)
+        if not n:
+            self.lst_keys.configure(state=tk.DISABLED)
+            return
+
+        keys = sorted({self._normalize_cfg_key(r.get('Config Key')) for r in self.by_name.get(n, []) if r.get('Config Key', '').strip()})
+
+        for k in keys:
+            self.lst_keys.insert(tk.END, k)
+
+        if keys:
+            self.lst_keys.configure(state=tk.NORMAL)
+            self.lst_keys.select_set(0, tk.END)
+            self.btn_compare.configure(state='normal')
+        else:
+            self.lst_keys.configure(state=tk.DISABLED)
+
+    # --------------- Comparison ---------------
+    def on_compare(self) -> None:
+        if not _HAVE_DD:
+            messagebox.showerror("Missing dependency", "Install deepdiff to run comparisons:\n\npip install deepdiff")
+            return
+
+        name = self.cmb_name.get().strip()
+        sel = self.lst_keys.curselection()
+        if not name or not sel:
+            return
+        selected_keys = [self.lst_keys.get(i) for i in sel]
+        selected_path = self._get_selected_diff_path()
+
+        rows_to_compare = [r for r in self.by_name.get(name, []) if self._normalize_cfg_key(r.get('Config Key')) in selected_keys]
+        diffs, stats = self._compute_all_diffs(rows_to_compare, name)
+
+        if len(diffs) > UIConfig.DIFF_DISPLAY_LIMIT:
+            msg = (f"The comparison generated {len(diffs):,} differences. "
+                   f"Displaying them all may slow down the UI.\n\n"
+                   f"Do you want to display only the first {UIConfig.DIFF_DISPLAY_LIMIT:,} results?")
+            if messagebox.askyesno("Large Result Set", msg):
+                diffs = diffs[:UIConfig.DIFF_DISPLAY_LIMIT]
+            else:
+                return
+
+        self.v_changed.set(f"Changed: {stats['changed']}")
+        self.v_added.set(f"Added: {stats['added']}")
+        self.v_removed.set(f"Removed: {stats['removed']}")
+
+        self._populate_table(diffs)
+        self._try_restore_selection(selected_path)
+
+        self.btn_clear.configure(state='normal')
+        self.btn_export_csv.configure(state='normal')
+        self.btn_export_txt.configure(state='normal')
+
+    def _compute_all_diffs(self, rows_to_compare: Iterable[Dict[str, str]], name: str) -> Tuple[List[RowMeta], Dict[str, int]]:
+        all_diffs: List[RowMeta] = []
+        stats = {'changed': 0, 'added': 0, 'removed': 0}
+        ignore_order = self.arrays_as_sets.get()
+
+        for row in rows_to_compare:
+            k = self._normalize_cfg_key(row['Config Key'])
+            old_obj, err1 = parse_jsonish_verbose(row['OLD PAYLOAD'])
+            cur_obj, err2 = parse_jsonish_verbose(row['CURRENT PAYLOAD'])
+            if err1: self.parse_logger.log(f"[{name}/{k}] OLD: {err1}", context=row['OLD PAYLOAD'][:200])
+            if err2: self.parse_logger.log(f"[{name}/{k}] CURRENT: {err2}", context=row['CURRENT PAYLOAD'][:200])
+
+            dd = DeepDiff(old_obj, cur_obj, ignore_order=ignore_order, verbose_level=2)
+
+            for diff_type, changes in dd.items():
+                if diff_type == 'values_changed':
+                    for path, change in changes.items():
+                        all_diffs.append(RowMeta(k, 'changed', dd_path_to_key(path), change['old_value'], change['new_value'], old_obj, cur_obj))
+                        stats['changed'] += 1
+                elif diff_type in ('dictionary_item_added', 'iterable_item_added'):
+                    for path, val in changes.items():
+                        all_diffs.append(RowMeta(k, 'added', dd_path_to_key(path), None, val, old_obj, cur_obj))
+                        stats['added'] += 1
+                elif diff_type in ('dictionary_item_removed', 'iterable_item_removed'):
+                    for path, val in changes.items():
+                        all_diffs.append(RowMeta(k, 'removed', dd_path_to_key(path), val, None, old_obj, cur_obj))
+                        stats['removed'] += 1
+                elif diff_type == 'type_changes':
+                    for path, change in changes.items():
+                        all_diffs.append(RowMeta(k, 'changed', dd_path_to_key(path), change['old_value'], change['new_value'], old_obj, cur_obj))
+                        stats['changed'] += 1
+        return all_diffs, stats
+
+    def _populate_table(self, diffs: List[RowMeta]) -> None:
+        self.tree.delete(*self.tree.get_children())
+        self._tree_meta.clear()
+
+        for meta in diffs:
+            tags = [meta.typ]
+            if self._row_is_watched(meta.path):
+                tags.append('watch')
+            iid = self.tree.insert('', tk.END, values=(meta.cfgkey, meta.typ, meta.path, self._s(meta.old), self._s(meta.new)), tags=tuple(tags))
+            self._tree_meta[iid] = meta
+
+        self._filter_tree()
+        if not self.tree.selection():
+            children = self.tree.get_children()
+            if children:
+                self.tree.selection_set(children[0])
+                self.tree.focus(children[0])
+                self.tree.see(children[0])
+
+    def on_tree_select(self, _evt=None) -> None:
+        sel = self.tree.selection()
+        if not sel:
+            return
+        meta = self._tree_meta.get(sel[0])
+        if not meta:
+            return
+
+        self._show_inline_diff(
+            self._s(meta.old),
+            self._s(meta.new)
+        )
+        # sanitize numbers for pretty JSON (no scientific)
+        self._render_full_payloads(
+            sanitize_numbers_for_display(meta.old_obj),
+            sanitize_numbers_for_display(meta.new_obj)
+        )
+
+        leaf_key = meta.path.split('.')[-1].split('[')[0]
+        self.after(50, lambda: self._highlight_in_panes(meta, leaf_key))
+
+    def _show_inline_diff(self, old_str: str, new_str: str) -> None:
+        self.txt_sel_old.delete('1.0', tk.END)
+        self.txt_sel_new.delete('1.0', tk.END)
+        sm = difflib.SequenceMatcher(a=old_str, b=new_str)
+
+        for op, i1, i2, j1, j2 in sm.get_opcodes():
+            if op == 'equal':
+                self.txt_sel_old.insert(tk.END, old_str[i1:i2])
+                self.txt_sel_new.insert(tk.END, new_str[j1:j2])
+            elif op in ('delete', 'replace'):
+                self.txt_sel_old.insert(tk.END, old_str[i1:i2], 'del')
+            if op in ('insert', 'replace'):
+                self.txt_sel_new.insert(tk.END, new_str[j1:j2], 'add')
+
+    def _render_full_payloads(self, old_obj: Any, new_obj: Any) -> None:
+        self.txt_old.delete('1.0', tk.END)
+        self.txt_cur.delete('1.0', tk.END)
+        self.txt_old.insert('1.0', pretty_json(old_obj))
+        self.txt_cur.insert('1.0', pretty_json(new_obj))
+
+    def _highlight_in_panes(self, meta: RowMeta, leaf_key: str) -> None:
+        if meta.typ in ('changed', 'removed'):
+            self._highlight_line_for_key_value(self.txt_old, leaf_key, meta.old)
+        if meta.typ in ('changed', 'added'):
+            self._highlight_line_for_key_value(self.txt_cur, leaf_key, meta.new)
+
+    def _highlight_line_for_key_value(self, widget: tk.Text, leaf_key: str, value: Any) -> None:
+        tag = "linehit"
+        widget.tag_remove(tag, "1.0", "end")
+        widget.tag_configure(tag, background=UIConfig.COLOR_LINE_HIT_BG, foreground=UIConfig.COLOR_LINE_HIT_FG)
+
+        text = widget.get("1.0", "end-1c")
+        if not text.strip():
+            return
+
+        key_pat = re.escape(f'"{leaf_key}"')
+        try:
+            # use sanitized string for matching
+            if isinstance(value, float):
+                vv = self._s(value)
+            else:
+                vv = json.dumps(value)
+        except Exception:
+            vv = None
+
+        match = None
+        if vv:
+            full_pat = re.compile(f"{key_pat}\\s*:\\s*{re.escape(vv)}")
+            match = full_pat.search(text)
+        if not match:
+            key_only_pat = re.compile(key_pat)
+            match = key_only_pat.search(text)
+
+        if match:
+            start_pos = f"1.0 + {match.start()} chars"
+            line_start = widget.index(f"{start_pos} linestart")
+            line_end = widget.index(f"{start_pos} lineend + 1 char")
+            widget.tag_add(tag, line_start, line_end)
+            widget.see(line_start)
+        else:
+            widget.tag_add(tag, "1.0", "2.0")
+            widget.see("1.0")
+
+    # --------------- Filtering / watch ---------------
+    def apply_watchlist(self) -> None:
+        text = self.ent_watch.get().strip()
+        self.watchlist = [w.strip().lower() for w in text.split(',') if w.strip()]
+        self._filter_tree()
+        self.on_compare()
+
+    def _row_is_watched(self, key_path: str) -> bool:
+        if not self.watchlist:
+            return False
+        lk = key_path.lower()
+        return any(w in lk for w in self.watchlist)
+
+    def _filter_tree(self, *_args) -> None:
+        query = self.search_var.get().strip().lower()
+        for iid, meta in self._tree_meta.items():
+            is_visible = True
+            if query:
+                haystack = f"{meta.cfgkey} {meta.typ} {meta.path} {self._s(meta.old)} {self._s(meta.new)}".lower()
+                is_visible = query in haystack
+            if is_visible and self.only_watch.get():
+                is_visible = self._row_is_watched(meta.path)
+
+            if not is_visible:
+                self.tree.detach(iid)
+            elif iid not in self.tree.get_children(''):
+                original_index = list(self._tree_meta.keys()).index(iid)
+                self.tree.move(iid, '', original_index)
+
+    # --------------- Exports ---------------
+    def on_export_csv(self) -> None:
+        if not self._tree_meta:
+            return
+        p = filedialog.asksaveasfilename(title='Save Visible Diffs as CSV', defaultextension='.csv', filetypes=[('CSV', '*.csv')])
+        if not p:
+            return
+        try:
+            with open(p, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Config Key', 'Type', 'Key Path', 'Old Value', 'New Value', 'Watched'])
+                for iid in self.tree.get_children():
+                    meta = self._tree_meta[iid]
+                    writer.writerow([
+                        meta.cfgkey, meta.typ, meta.path,
+                        self._s(meta.old), self._s(meta.new),
+                        'YES' if self._row_is_watched(meta.path) else ''
+                    ])
+            messagebox.showinfo('Saved', f'CSV saved to:\n{p}')
+        except IOError as e:
+            messagebox.showerror('Error', f'Failed to save CSV:\n{e}')
+
+    def on_export_txt(self) -> None:
+        if not self._tree_meta:
+            return
+        p = filedialog.asksaveasfilename(title='Save Visible Diffs as TXT', defaultextension='.txt', filetypes=[('Text', '*.txt')])
+        if not p:
+            return
+
+        grouped: Dict[str, List[RowMeta]] = {}
+        for iid in self.tree.get_children():
+            meta = self._tree_meta[iid]
+            grouped.setdefault(meta.cfgkey, []).append(meta)
+
+        lines = []
+        for cfgkey, items in grouped.items():
+            lines.append(f"=== Config Key: {cfgkey} ===")
+            for typ in ('changed', 'added', 'removed'):
+                diffs_of_type = [m for m in items if m.typ == typ]
+                if not diffs_of_type:
+                    continue
+                lines.append(f"\n-- {typ.upper()} ({len(diffs_of_type)}) --")
+                for m in diffs_of_type:
+                    lines.append(f"Key: {m.path}")
+                    if m.typ == 'changed':
+                        lines.append(f"  Old: {self._s(m.old)}")
+                        lines.append(f"  New: {self._s(m.new)}")
+                        lines.append("  Fragment (OLD):")
+                        lines.append(self._format_fragment(m.path, m.old))
+                        lines.append("  Fragment (NEW):")
+                        lines.append(self._format_fragment(m.path, m.new))
+                    elif m.typ == 'added':
+                        lines.append(f"  New: {self._s(m.new)}")
+                        lines.append("  Fragment (NEW):")
+                        lines.append(self._format_fragment(m.path, m.new))
+                    elif m.typ == 'removed':
+                        lines.append(f"  Old: {self._s(m.old)}")
+                        lines.append("  Fragment (OLD):")
+                        lines.append(self._format_fragment(m.path, m.old))
+            lines.append("\n" + "="*60 + "\n")
+
+        try:
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+            messagebox.showinfo('Saved', f'TXT saved to:\n{p}')
+        except IOError as e:
+            messagebox.showerror('Error', f'Failed to save TXT:\n{e}')
+
+    def _format_fragment(self, path: str, value: Any) -> str:
+        try:
+            frag = build_fragment_from_path_value(path, value)
+            pretty = pretty_json(sanitize_numbers_for_display(frag))
+            return '\n'.join(f"    {line}" for line in pretty.splitlines())
+        except Exception:
+            return "    (fragment generation error)"
+
+    # --------------- Column confirm dialog ---------------
+    def _confirm_column_mapping(self, headers: List[str], mapping: Dict[str, int],
+                                confidence: Dict[str, float]) -> Optional[Dict[str, int]]:
+        dialog = tk.Toplevel(self)
+        dialog.title("Confirm Column Mapping")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        ttk.Label(dialog, text="Please confirm or adjust the column mappings:",
+                  font=('TkDefaultFont', 10, 'bold')).grid(row=0, column=0, columnspan=3, pady=10, padx=10, sticky='w')
+
+        combos: Dict[str, ttk.Combobox] = {}
+        for i, role in enumerate(NEEDED_ROLES, 1):
+            ttk.Label(dialog, text=f"{role}:").grid(row=i, column=0, padx=10, pady=5, sticky='e')
+            combo = ttk.Combobox(dialog, values=headers, width=48, state="readonly")
+            if role in mapping:
+                combo.set(headers[mapping[role]])
+            combo.grid(row=i, column=1, padx=5, pady=5, sticky='w')
+            combos[role] = combo
+
+            conf_val = confidence.get(role, 0.0)
+            color = "green" if conf_val >= 0.7 else ("orange" if conf_val >= 0.4 else "red")
+            ttk.Label(dialog, text=f"({conf_val:.0%})", foreground=color).grid(row=i, column=2, padx=5, pady=5, sticky='w')
+
+        result = {"mapping": None}
+        def on_ok():
+            new_mapping = {role: headers.index(combo.get()) for role, combo in combos.items() if combo.get()}
+            if len({idx for idx in new_mapping.values()}) != len(new_mapping):
+                messagebox.showerror("Duplicate Columns", "Each role must be mapped to a unique column.", parent=dialog)
+                return
+            result["mapping"] = new_mapping
+            dialog.destroy()
+
+        btns = ttk.Frame(dialog)
+        btns.grid(row=len(NEEDED_ROLES)+1, column=0, columnspan=3, pady=10)
+        ttk.Button(btns, text="OK", command=on_ok).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=6)
+
+        dialog.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() // 2) - (dialog.winfo_width() // 2)
+        y = self.winfo_rooty() + (self.winfo_height() // 2) - (dialog.winfo_height() // 2)
+        dialog.geometry(f"+{x}+{y}")
+        self.wait_window(dialog)
+        return result["mapping"]
+
+    # --------------- Threaded progress ---------------
+    def _with_progress_threaded(self, task_fn: Callable, title: str, done_cb: Callable,
+                                determinate: bool = False) -> None:
+        """
+        Run task_fn(progress_cb) in a worker thread and update a modal progress dialog.
+        progress_cb(step:int, msg:str) should send step 0..100.
+        """
+        top = tk.Toplevel(self)
+        top.title(title)
+        top.transient(self)
+        top.resizable(False, False)
+        top.protocol("WM_DELETE_WINDOW", lambda: None)  # prevent closing
+
+        ttk.Label(top, text=title, font=('TkDefaultFont', 10)).pack(padx=20, pady=(15, 6))
+        pb = ttk.Progressbar(top, mode='determinate' if determinate else 'indeterminate', length=350, maximum=100)
+        pb.pack(padx=20, pady=(0, 10))
+        if not determinate:
+            pb.start(10)
+
+        status_lbl = ttk.Label(top, text="Starting...")
+        status_lbl.pack(padx=20, pady=(0, 15))
+
+        q_out: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
+        q_prog: "queue.Queue[Tuple[int, str]]" = queue.Queue()
+
+        def worker():
+            try:
+                progress = (lambda step, msg: q_prog.put((int(step), str(msg)))) if determinate else None
+                res = task_fn(progress)
+                q_out.put(('ok', res))
+            except Exception as e:
+                q_out.put(('err', e))
+
+        def close_dialog():
+            try:
+                if not determinate:
+                    pb.stop()
+            except Exception:
+                pass
+            try:
+                top.destroy()
+            except Exception:
+                pass
+
+        def poll():
+            # Progress updates
+            try:
+                while True:
+                    step, msg = q_prog.get_nowait()
+                    try:
+                        pb['value'] = max(0, min(100, int(step)))
+                        status_lbl.config(text=msg)
+                    except Exception:
+                        pass
+            except queue.Empty:
+                pass
+
+            # Completion
+            try:
+                status, payload = q_out.get_nowait()
+                close_dialog()
+                if status == 'ok':
+                    done_cb(payload)
+                else:
+                    messagebox.showerror("Error", f"An error occurred during loading:\n{payload}")
+                return  # stop polling
+            except queue.Empty:
+                pass
+
+            # Re-schedule poll
+            try:
+                self.after(100, poll)
+            except Exception:
+                close_dialog()
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(100, poll)
+
+    # --------------- Small helpers ---------------
+    def _reset_views(self) -> None:
+        self.tree.delete(*self.tree.get_children())
+        self._tree_meta.clear()
+        self.txt_sel_old.delete('1.0', tk.END)
+        self.txt_sel_new.delete('1.0', tk.END)
+        self.txt_old.delete('1.0', tk.END)
+        self.txt_cur.delete('1.0', tk.END)
+        self.v_changed.set('Changed: 0')
+        self.v_added.set('Added: 0')
+        self.v_removed.set('Removed: 0')
+        self.search_var.set('')
+
+        self.btn_clear.configure(state='disabled')
+        self.btn_export_csv.configure(state='disabled')
+        self.btn_export_txt.configure(state='disabled')
+
+    def _s(self, v: Any) -> str:
+        """
+        Safe string for table/export:
+          - dict/list -> JSON string
+          - floats -> non-scientific if possible
+          - strings containing scientific notation -> expanded
+        """
+        if v is None:
+            return ''
+        if isinstance(v, (dict, list)):
+            try:
+                return json.dumps(sanitize_numbers_for_display(v), ensure_ascii=False)
+            except TypeError:
+                return str(v)
+        if isinstance(v, float):
+            maybe = _maybe_int_from_float_str(v)
+            return str(maybe) if maybe is not None else _de_sci_str(str(v))
+        if isinstance(v, str):
+            return _de_sci_str(v)
+        return str(v)
+
+    def _get_selected_diff_path(self) -> Optional[str]:
+        if not self.tree.selection():
+            return None
+        meta = self._tree_meta.get(self.tree.selection()[0])
+        return meta.path if meta else None
+
+    def _try_restore_selection(self, path_to_select: Optional[str]) -> None:
+        if not path_to_select:
+            return
+        for iid, meta in self._tree_meta.items():
+            if meta.path == path_to_select:
+                self.tree.selection_set(iid)
+                self.tree.focus(iid)
+                self.tree.see(iid)
+                break
+
+    def show_shortcuts_help(self) -> None:
+        messagebox.showinfo("Keyboard Shortcuts",
+                            "Ctrl+O : Open file\n"
+                            "Ctrl+S : Export visible rows to CSV\n"
+                            "Ctrl+E : Export visible rows to TXT\n"
+                            "Ctrl+F : Focus the filter box\n"
+                            "Ctrl+M : Open Summary dashboard\n\n"
+                            "F5     : Run comparison on selected keys\n"
+                            "Esc    : Remove focus from the current widget")
+
+    # --------------- Settings: default folder ---------------
+    def _get_initial_open_dir(self) -> Optional[str]:
+        d = self.settings.get("default_open_dir")
+        if d:
+            if str(d).lower().startswith(("http://", "https://")):
+                unc = sharepoint_url_to_unc(d)
+                if unc and os.path.isdir(unc):
+                    return unc
+            elif os.path.isdir(d):
+                return d
+        if self._last_open_dir and os.path.isdir(self._last_open_dir):
+            return self._last_open_dir
+        return None
+
+    def on_set_default_folder(self) -> None:
+        p = filedialog.askdirectory(title="Choose Default Folder for Open")
+        if not p:
+            return
+        self.settings.set("default_open_dir", p)
+        self.settings.save()
+        messagebox.showinfo("Default Folder", f"Default open folder set to:\n{p}")
+
+    def _set_default_from_sp_url(self) -> None:
+        url = simpledialog.askstring("SharePoint / OneDrive URL", "Paste a SharePoint/OneDrive folder URL:")
+        if not url:
+            return
+        self.settings.set("default_open_dir", url.strip())
+        self.settings.save()
+        messagebox.showinfo("Default Folder", "Saved SharePoint URL. I’ll use its UNC/WebDAV path if available.")
+
+    # --------------- Summary (OO Matplotlib; no pyplot) ---------------
+    def _safe_fig_size_for_tk(self, n_bars: int) -> tuple[float, float, int]:
+        dpi = 100
+        width_in = 7.0
+        height_in = min(0.38 * max(1, n_bars) + 1.4, 18.0)
+        return width_in, height_in, dpi
+
+    def _export_summary_csv(self, names: List[str], counts: List[int]) -> None:
+        p = filedialog.asksaveasfilename(
+            title="Export Summary CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+        )
+        if not p:
+            return
+        try:
+            with open(p, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["Config Name", "Count"])
+                for n, c in zip(names, counts):
+                    w.writerow([n, c])
+            messagebox.showinfo("Saved", f"Summary exported to:\n{p}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save summary CSV:\n{e}")
+
+    def _build_chart_figure(self, names: List[str], counts: List[int], max_label_len: int) -> Optional[Figure]:
+        if not _HAVE_MPL or not names:
+            return None
+
+        def truncate_label(s: str, L: int) -> str:
+            s = s.strip()
+            return s if len(s) <= L else (s[: L - 1] + "…")
+
+        def wrap_label(s: str, width: int = 16) -> str:
+            s = s.replace("_", " ")
+            parts: List[str] = []
+            cur = ""
+            for ch in s:
+                cur += ch
+                if len(cur) >= width and ch == " ":
+                    parts.append(cur.rstrip())
+                    cur = ""
+            if cur:
+                parts.append(cur.rstrip())
+            return "\n".join(parts) if len(parts) > 1 else s
+
+        labels = [wrap_label(truncate_label(n, max_label_len), 16) for n in names]
+
+        fig_w, fig_h, fig_dpi = self._safe_fig_size_for_tk(len(labels))
+        fig = Figure(figsize=(fig_w, fig_h), dpi=fig_dpi)
+        ax = fig.add_subplot(111)
+        y = list(range(len(labels)))
+        bars = ax.barh(y, counts)
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels, fontsize=9)
+        ax.invert_yaxis()
+        ax.set_xlabel("Count")
+        ax.set_title("Rows per Config Name")
+        ax.grid(axis="x", alpha=0.25, linestyle="--", linewidth=0.6)
+        try:
+            for rect, c in zip(bars, counts):
+                ax.text(rect.get_width() + max(1, 0.01 * rect.get_width()), rect.get_y() + rect.get_height()/2,
+                        f"{c:,}", va="center", fontsize=8)
+        except Exception:
+            pass
+        left_margin = min(0.65, 0.22 + 0.012 * min(max_label_len, 60))
+        fig.subplots_adjust(left=left_margin, right=0.97, top=0.95, bottom=0.08)
+        return fig
+
+    def _save_summary_chart_png(self, names: List[str], counts: List[int], max_label_len: int = 28) -> None:
+        if not _HAVE_MPL:
+            messagebox.showinfo("Chart", "Matplotlib not installed. Install matplotlib to export charts.")
+            return
+        p = filedialog.asksaveasfilename(
+            title="Save Chart PNG",
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png")],
+        )
+        if not p:
+            return
+        fig = self._build_chart_figure(names, counts, max_label_len)
+        if fig is None:
+            messagebox.showwarning("Chart", "No data available to export.")
+            return
+        try:
+            fig.savefig(p, dpi=fig.dpi, bbox_inches="tight")
+            messagebox.showinfo("Saved", f"Chart saved to:\n{p}")
+        finally:
+            try:
+                import matplotlib.pyplot as _plt  # local import, safe if available
+                _plt.close(fig)
+            except Exception:
+                pass
+
+    def on_view_summary(self) -> None:
+        win = tk.Toplevel(self)
+        win.title("Summary: Rows per Config Name")
+        win.geometry("900x600")
+        win.minsize(700, 480)
+
+        counts: Dict[str, int] = {nm: len(items) for nm, items in self.by_name.items()}
+        pairs = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+
+        ctrl = ttk.Frame(win); ctrl.pack(fill=tk.X, padx=10, pady=8)
+
+        def _validate_int(P: str, minv: int, maxv: int) -> bool:
+            if P == "":
+                return True
+            if not P.isdigit():
+                return False
+            val = int(P)
+            return minv <= val <= maxv
+
+        v_topn = (win.register(lambda P: _validate_int(P, 1, 400)), "%P")
+        v_lbl = (win.register(lambda P: _validate_int(P, 10, 80)), "%P")
+
+        ttk.Label(ctrl, text="Top N:").pack(side=tk.LEFT)
+        topn_var = tk.IntVar(value=25)
+        spn = ttk.Spinbox(ctrl, from_=5, to=400, width=6, textvariable=topn_var, validate="key", validatecommand=v_topn)
+        spn.pack(side=tk.LEFT, padx=(4, 12))
+
+        ttk.Label(ctrl, text="Max label length:").pack(side=tk.LEFT)
+        maxlbl_var = tk.IntVar(value=28)
+        spn2 = ttk.Spinbox(ctrl, from_=10, to=80, width=6, textvariable=maxlbl_var, validate="key", validatecommand=v_lbl)
+        spn2.pack(side=tk.LEFT, padx=(4, 12))
+
+        export_btn = ttk.Button(ctrl, text="Export Summary CSV")
+        export_btn.pack(side=tk.LEFT, padx=6)
+
+        savepng_btn = ttk.Button(ctrl, text="Save Chart PNG")
+        if _HAVE_MPL:
+            savepng_btn.pack(side=tk.LEFT, padx=6)
+        else:
+            ttk.Label(ctrl, text="Chart unavailable (install matplotlib)", foreground="#a00").pack(side=tk.LEFT, padx=8)
+
+        body = ttk.PanedWindow(win, orient=tk.HORIZONTAL); body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        frm_table = ttk.Frame(body); body.add(frm_table, weight=1)
+        frm_plot = ttk.Frame(body); body.add(frm_plot, weight=1)
+
+        tv = ttk.Treeview(frm_table, columns=("Config Name", "Count"), show="headings", selectmode="browse")
+        tv.heading("Config Name", text="Config Name")
+        tv.heading("Count", text="Count")
+        tv.column("Config Name", width=260, anchor="w")
+        tv.column("Count", width=100, anchor="e")
+        vsb = ttk.Scrollbar(frm_table, orient="vertical", command=tv.yview)
+        tv.configure(yscroll=vsb.set)
+        tv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        tv.tag_configure("odd", background="#f7f7f7")
+        tv.tag_configure("total", background="#fff3cd")
+
+        chart_canvas: Optional[FigureCanvasTkAgg] = None  # type: ignore
+        chart_fig: Optional[Figure] = None
+        current_names_full: List[str] = []
+        current_counts: List[int] = []
+
+        def render():
+            nonlocal chart_canvas, chart_fig, current_names_full, current_counts
+            view = pairs[: max(1, int(topn_var.get() or 25))]
+            current_names_full = [p[0] for p in view]
+            current_counts = [p[1] for p in view]
+
+            tv.delete(*tv.get_children())
+            total = 0
+            for i, (nm, ct) in enumerate(view):
+                tags = ("odd",) if i % 2 else ()
+                tv.insert('', tk.END, values=(nm, f"{ct:,}"), tags=tags)
+                total += ct
+            tv.insert('', tk.END, values=("Grand Total", f"{total:,}"), tags=("total",))
+
+            # Chart
+            if _HAVE_MPL:
+                if chart_canvas is not None:
+                    try:
+                        chart_canvas.get_tk_widget().destroy()
+                    except Exception:
+                        pass
+                    chart_canvas = None
+                chart_fig = self._build_chart_figure(current_names_full, current_counts, int(maxlbl_var.get() or 28))
+                if chart_fig is not None:
+                    chart_canvas = FigureCanvasTkAgg(chart_fig, master=frm_plot)  # type: ignore
+                    chart_canvas.draw()
+                    chart_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+            export_btn.configure(command=lambda: self._export_summary_csv(current_names_full, current_counts))
+            if _HAVE_MPL:
+                savepng_btn.configure(command=lambda: self._save_summary_chart_png(current_names_full, current_counts,
+                                                                                   int(maxlbl_var.get() or 28)))
+
+        render()
+        topn_var.trace_add("write", lambda *_: render())
+        maxlbl_var.trace_add("write", lambda *_: render())
+
+    # --------------- main ---------------
+if __name__ == "__main__":
+    App().mainloop()

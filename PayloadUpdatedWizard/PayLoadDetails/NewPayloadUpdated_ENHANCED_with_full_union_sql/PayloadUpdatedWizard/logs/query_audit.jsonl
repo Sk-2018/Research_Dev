@@ -1,0 +1,2 @@
+{"ts_iso": "2025-11-09T21:12:39", "op": "test_connection", "status": "error", "error_message": "could not translate host name \"ljnb5cdb7466\" to address: Name or service not known\n", "host": "ljnb5cdb7466", "port": 6432, "db_name": "pgdb_msdc1"}
+{"ts_iso": "2025-11-09T21:14:58", "op": "test_connection", "status": "error", "error_message": "could not translate host name \"ljnb5cdb7466\" to address: Name or service not known\n", "host": "ljnb5cdb7466", "port": 6432, "db_name": "pgdb_msdc1"}
