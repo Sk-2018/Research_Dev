@@ -1,3 +1,1 @@
-from app.storage.db import GuardianDB
-
-__all__ = ["GuardianDB"]
+from .db import Database
