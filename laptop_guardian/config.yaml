@@ -1,0 +1,32 @@
+system:
+  poll_interval_sec: 5
+  db_path: "guardian_metrics.db"
+  log_path: "guardian.log"
+  history_points: 120
+
+thresholds:
+  temp_warn: 80.0
+  temp_critical: 90.0
+  cpu_sustained_warn: 85.0
+  risk_score_critical: 80
+  risk_score_restore: 30
+
+actions:
+  dry_run: false
+  allowlist_kill: ["node.exe", "python.exe", "chrome.exe"]
+  never_kill: ["explorer.exe", "svchost.exe", "system", "dash", "Code.exe"]
+  power_saver_guid: "a1841308-3541-4fab-bc81-f71556f20b4a"
+  balanced_guid: "381b4222-f694-41f0-9685-ff5bb260df2e"
+  action_cooldown_sec: 30
+  max_kill_per_cycle: 1
+
+agent:
+  use_llm: false
+  ollama_url: "http://localhost:11434/api/generate"
+  model: "phi3"
+  timeout_sec: 5
+
+dashboard:
+  host: "127.0.0.1"
+  port: 8050
+  refresh_ms: 5000

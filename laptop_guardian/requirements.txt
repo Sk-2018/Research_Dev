@@ -1,0 +1,7 @@
+﻿dash==2.14.0
+plotly==5.18.0
+psutil==5.9.6
+pyyaml==6.0.1
+pandas==2.1.4
+requests==2.31.0
+win10toast==0.9

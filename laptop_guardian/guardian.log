@@ -1,0 +1,9 @@
+2026-03-01 09:06:34 | INFO | guardian | Starting Jarvis watchdog
+2026-03-01 09:06:34 | WARNING | guardian | Toast notifications unavailable: No module named 'win10toast'
+2026-03-01 09:06:34 | INFO | guardian | Watchdog daemon started with poll_interval=5s
+2026-03-01 09:06:34 | INFO | guardian | Starting dashboard at http://127.0.0.1:8050
+2026-03-01 09:06:37 | INFO | guardian | Watchdog daemon stopped
+2026-03-01 09:08:31 | INFO | guardian | Starting Jarvis watchdog
+2026-03-01 09:08:31 | WARNING | guardian | Toast notifications unavailable: No module named 'pkg_resources'
+2026-03-01 09:08:31 | INFO | guardian | Watchdog daemon started with poll_interval=5s
+2026-03-01 09:08:31 | INFO | guardian | Starting dashboard at http://127.0.0.1:8050

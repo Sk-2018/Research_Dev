@@ -1,0 +1,73 @@
+# Laptop Health Guardian configuration
+
+general:
+  sample_interval_seconds: 3
+  log_retention_days: 7
+  db_path: "guardian.db"
+  log_path: "logs/guardian.log"
+  dry_run: false
+  top_n_processes: 10
+
+dashboard:
+  host: "127.0.0.1"
+  port: 8050
+  chart_window_minutes: 30
+
+thresholds:
+  temp_warn: 75.0
+  temp_critical: 88.0
+  cpu_warn: 80.0
+  cpu_critical: 95.0
+  ram_warn: 85.0
+  ram_critical: 95.0
+  temp_slope_warn: 3.0
+  temp_slope_critical: 6.0
+
+risk_weights:
+  temp_abs: 0.40
+  temp_slope: 0.25
+  cpu_sustained: 0.25
+  ram_pressure: 0.10
+
+actions:
+  switch_power_saver_on_warn: true
+  restore_power_plan_on_cool: true
+  lower_process_priority_on_warn: true
+  toast_on_critical: true
+  suspend_workloads_on_critical: false
+
+process_allowlist:
+  priority_lower:
+    - "node.exe"
+    - "python.exe"
+    - "docker.exe"
+    - "java.exe"
+    - "code.exe"
+  kill_candidates:
+    - "node.exe"
+    - "python.exe"
+    - "java.exe"
+
+agent:
+  enabled: true
+  use_llm: false
+  ollama_url: "http://localhost:11434/api/generate"
+  ollama_model: "mistral"
+  rule_based_fallback: true
+
+accountability:
+  policy_version: "2026-03-01"
+  record_noop_decisions: true
+  allow_destructive_actions: false
+  block_unconfirmed_actions: true
+
+ats:
+  enabled: true
+  evaluation_interval_seconds: 120
+  toast_cooldown_seconds: 1800
+  maintenance_toast_threshold: 40.0
+  script_path: "..\\ATS_Maintenance_Aspire.bat"
+
+event_log:
+  enabled: true
+  look_back_hours: 24
