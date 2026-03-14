@@ -1,16 +1,14 @@
-# Read current scorer.py
-with open('app/risk/scorer.py', 'r') as f:
-    current_content = f.read()
+from __future__ import annotations
 
-# Read wrapper code
-with open('scorer_wrappers.py', 'r') as f:
-    wrapper_code = f.read()
+from pathlib import Path
 
-# Append wrapper code
-new_content = current_content + wrapper_code
 
-# Write back
-with open('app/risk/scorer.py', 'w') as f:
-    f.write(new_content)
+def main() -> None:
+    scorer_path = Path("app/risk/scorer.py")
+    if not scorer_path.exists():
+        raise FileNotFoundError(f"Missing scorer module: {scorer_path}")
+    print("Compatibility wrappers already live in app/risk/scorer.py; no file changes applied.")
 
-print("✓ Wrapper code appended to scorer.py")
+
+if __name__ == "__main__":
+    main()

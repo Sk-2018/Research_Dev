@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 from typing import Any
+
+
+_SCORER_CACHE: dict[int, "RiskScorer"] = {}
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -43,6 +47,11 @@ class RiskScorer:
             return 0.0
         return (last - first) / elapsed_minutes
 
+    def _cpu_average_percent(self) -> float:
+        if not self._cpu_history:
+            return 0.0
+        return sum(self._cpu_history) / len(self._cpu_history)
+
     def evaluate(self, metrics: dict[str, Any]) -> dict[str, Any]:
         thresholds = self.config["thresholds"]
         weights = self.config["risk_weights"]
@@ -56,7 +65,8 @@ class RiskScorer:
         self._cpu_history.append(cpu_percent)
 
         temp_slope = self._temperature_slope_c_per_min()
-        cpu_avg = sum(self._cpu_history) / max(1, len(self._cpu_history))
+        cpu_avg = self._cpu_average_percent()
+        has_sustained_cpu_history = len(self._cpu_history) >= 2
 
         temp_abs_component = _ratio(temp_c, _safe_float(thresholds["temp_warn"]), _safe_float(thresholds["temp_critical"]))
         temp_slope_component = _ratio(
@@ -64,7 +74,9 @@ class RiskScorer:
             _safe_float(thresholds["temp_slope_warn"]),
             _safe_float(thresholds["temp_slope_critical"]),
         )
-        cpu_component = _ratio(cpu_avg, _safe_float(thresholds["cpu_warn"]), _safe_float(thresholds["cpu_critical"]))
+        cpu_component = 0.0
+        if has_sustained_cpu_history:
+            cpu_component = _ratio(cpu_avg, _safe_float(thresholds["cpu_warn"]), _safe_float(thresholds["cpu_critical"]))
         ram_component = _ratio(ram_percent, _safe_float(thresholds["ram_warn"]), _safe_float(thresholds["ram_critical"]))
 
         weighted_score = (
@@ -89,10 +101,11 @@ class RiskScorer:
         elif cpu_percent >= _safe_float(thresholds["cpu_warn"]):
             flags.append("cpu_warn_now")
 
-        if cpu_avg >= _safe_float(thresholds["cpu_critical"]):
-            flags.append("cpu_critical_sustained")
-        elif cpu_avg >= _safe_float(thresholds["cpu_warn"]):
-            flags.append("cpu_warn_sustained")
+        if has_sustained_cpu_history:
+            if cpu_avg >= _safe_float(thresholds["cpu_critical"]):
+                flags.append("cpu_critical_sustained")
+            elif cpu_avg >= _safe_float(thresholds["cpu_warn"]):
+                flags.append("cpu_warn_sustained")
 
         if ram_percent >= _safe_float(thresholds["ram_critical"]):
             flags.append("ram_critical")
@@ -120,13 +133,20 @@ class RiskScorer:
         }
 
 
+def _get_cached_scorer(config: dict[str, Any]) -> RiskScorer:
+    key = id(config)
+    scorer = _SCORER_CACHE.get(key)
+    if scorer is None or scorer.config is not config:
+        scorer = RiskScorer(config)
+        _SCORER_CACHE[key] = scorer
+    return scorer
+
+
 def calculate_risk_score(metrics: dict[str, Any], config: dict[str, Any]) -> int:
-    scorer = RiskScorer(config)
+    scorer = _get_cached_scorer(config)
     return int(scorer.evaluate(metrics)["risk_score"])
 
 # ===== Scheduler Compatibility Wrappers =====
-from dataclasses import dataclass
-
 TIER_INFO     = "normal"
 TIER_WARN     = "warn"
 TIER_CRITICAL = "critical"
@@ -150,7 +170,7 @@ def compute(telemetry: dict[str, Any], cfg: dict[str, Any]) -> RiskResult:
     }
     
     # Run the new scorer
-    scorer = RiskScorer(cfg)
+    scorer = _get_cached_scorer(cfg)
     result = scorer.evaluate(metrics)
     
     # Map new format to old format
