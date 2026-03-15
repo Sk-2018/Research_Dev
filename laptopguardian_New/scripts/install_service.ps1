@@ -1,34 +1,28 @@
-param(
-    [string]$TaskName = "LaptopHealthGuardian",
-    [string]$Config = "config.yaml"
-)
+@'
+# Install Guardian as a Windows Scheduled Task (runs at logon, background)
+# Run as Administrator
 
 $ErrorActionPreference = "Stop"
+$ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ProjectRoot = Split-Path -Parent $ScriptDir
+$PythonExe  = Join-Path $ProjectRoot "venv\Scripts\python.exe"
+$MainScript = Join-Path $ProjectRoot "app\main.py"
+$TaskName   = "LaptopHealthGuardian"
 
-$ProjectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$PythonExe = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 if (-not (Test-Path $PythonExe)) {
-    throw "Python virtual environment not found at $PythonExe. Run scripts/run.ps1 once first."
+    Write-Error "venv not found. Run scripts\run.ps1 first to create the venv."
+    exit 1
 }
 
-$ConfigPath = Join-Path $ProjectRoot $Config
-if (-not (Test-Path $ConfigPath)) {
-    throw "Config file not found: $ConfigPath"
-}
+$Action  = New-ScheduledTaskAction -Execute $PythonExe -Argument "-m app.main" -WorkingDirectory $ProjectRoot
+$Trigger = New-ScheduledTaskTrigger -AtLogOn
+$Settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
+             -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+             -StartWhenAvailable
 
-$Action = New-ScheduledTaskAction -Execute $PythonExe -Argument "-m app.main --headless --config `"$ConfigPath`"" -WorkingDirectory $ProjectRoot
-$Trigger = New-ScheduledTaskTrigger -AtStartup
-$Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest -LogonType Interactive
-$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger `
+    -Settings $Settings -RunLevel Highest -Force
 
-Register-ScheduledTask `
-    -TaskName $TaskName `
-    -Action $Action `
-    -Trigger $Trigger `
-    -Principal $Principal `
-    -Settings $Settings `
-    -Description "Laptop Health Guardian background watchdog" `
-    -Force | Out-Null
-
-Write-Host "Scheduled task '$TaskName' created."
-Write-Host "Start it with: Start-ScheduledTask -TaskName $TaskName"
+Write-Host "Scheduled Task '$TaskName' registered. Guardian will start at next logon." -ForegroundColor Green
+Write-Host "To start now: Start-ScheduledTask -TaskName '$TaskName'"
+'@ | Out-File -FilePath "scripts\install_service.ps1" -Encoding utf8

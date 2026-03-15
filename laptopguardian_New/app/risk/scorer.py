@@ -1,182 +1,125 @@
-from __future__ import annotations
-
-from collections import deque
+"""
+Thermal Risk Scorer.
+Produces a 0-100 score and an alert tier: INFO / WARN / CRITICAL.
+Uses a sliding window of recent temp readings to compute slope (°C/min).
+"""
+import time, collections, logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Optional, Deque
 
+logger = logging.getLogger(__name__)
 
-_SCORER_CACHE: dict[int, "RiskScorer"] = {}
+TIER_INFO     = "INFO"
+TIER_WARN     = "WARN"
+TIER_CRITICAL = "CRITICAL"
 
-
-def _clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return float(default)
-
-
-def _ratio(value: float, warn: float, critical: float) -> float:
-    if value < 0:
-        return 0.0
-    if critical <= warn:
-        return 1.0 if value > warn else 0.0
-    if value <= warn:
-        return 0.0
-    return _clamp((value - warn) / (critical - warn), 0.0, 1.0)
-
-
-class RiskScorer:
-    def __init__(self, config: dict[str, Any]) -> None:
-        self.config = config
-        self._sample_interval_s = max(1.0, _safe_float(config["general"].get("sample_interval_seconds"), 3.0))
-        self._temp_history = deque(maxlen=40)
-        self._cpu_history = deque(maxlen=20)
-
-    def _temperature_slope_c_per_min(self) -> float:
-        if len(self._temp_history) < 2:
-            return 0.0
-        first = self._temp_history[0]
-        last = self._temp_history[-1]
-        points_between = max(1, len(self._temp_history) - 1)
-        elapsed_minutes = (points_between * self._sample_interval_s) / 60.0
-        if elapsed_minutes <= 0:
-            return 0.0
-        return (last - first) / elapsed_minutes
-
-    def _cpu_average_percent(self) -> float:
-        if not self._cpu_history:
-            return 0.0
-        return sum(self._cpu_history) / len(self._cpu_history)
-
-    def evaluate(self, metrics: dict[str, Any]) -> dict[str, Any]:
-        thresholds = self.config["thresholds"]
-        weights = self.config["risk_weights"]
-
-        temp_c = _safe_float(metrics.get("temp_c"), -1.0)
-        cpu_percent = _safe_float(metrics.get("cpu_percent"), 0.0)
-        ram_percent = _safe_float(metrics.get("ram_percent"), 0.0)
-
-        if temp_c > 0:
-            self._temp_history.append(temp_c)
-        self._cpu_history.append(cpu_percent)
-
-        temp_slope = self._temperature_slope_c_per_min()
-        cpu_avg = self._cpu_average_percent()
-        has_sustained_cpu_history = len(self._cpu_history) >= 2
-
-        temp_abs_component = _ratio(temp_c, _safe_float(thresholds["temp_warn"]), _safe_float(thresholds["temp_critical"]))
-        temp_slope_component = _ratio(
-            temp_slope,
-            _safe_float(thresholds["temp_slope_warn"]),
-            _safe_float(thresholds["temp_slope_critical"]),
-        )
-        cpu_component = 0.0
-        if has_sustained_cpu_history:
-            cpu_component = _ratio(cpu_avg, _safe_float(thresholds["cpu_warn"]), _safe_float(thresholds["cpu_critical"]))
-        ram_component = _ratio(ram_percent, _safe_float(thresholds["ram_warn"]), _safe_float(thresholds["ram_critical"]))
-
-        weighted_score = (
-            temp_abs_component * _safe_float(weights["temp_abs"])
-            + temp_slope_component * _safe_float(weights["temp_slope"])
-            + cpu_component * _safe_float(weights["cpu_sustained"])
-            + ram_component * _safe_float(weights["ram_pressure"])
-        )
-        risk_score = int(round(_clamp(weighted_score * 100.0, 0.0, 100.0)))
-
-        flags: list[str] = []
-        if temp_c < 0:
-            flags.append("temperature_unavailable")
-        else:
-            if temp_c >= _safe_float(thresholds["temp_critical"]):
-                flags.append("temp_critical")
-            elif temp_c >= _safe_float(thresholds["temp_warn"]):
-                flags.append("temp_warn")
-
-        if cpu_percent >= _safe_float(thresholds["cpu_critical"]):
-            flags.append("cpu_critical_now")
-        elif cpu_percent >= _safe_float(thresholds["cpu_warn"]):
-            flags.append("cpu_warn_now")
-
-        if has_sustained_cpu_history:
-            if cpu_avg >= _safe_float(thresholds["cpu_critical"]):
-                flags.append("cpu_critical_sustained")
-            elif cpu_avg >= _safe_float(thresholds["cpu_warn"]):
-                flags.append("cpu_warn_sustained")
-
-        if ram_percent >= _safe_float(thresholds["ram_critical"]):
-            flags.append("ram_critical")
-        elif ram_percent >= _safe_float(thresholds["ram_warn"]):
-            flags.append("ram_warn")
-
-        if temp_slope >= _safe_float(thresholds["temp_slope_critical"]):
-            flags.append("temp_slope_critical")
-        elif temp_slope >= _safe_float(thresholds["temp_slope_warn"]):
-            flags.append("temp_slope_warn")
-
-        if any(flag.endswith("critical") or "critical_" in flag for flag in flags) or risk_score >= 85:
-            risk_level = "critical"
-        elif any(flag.endswith("warn") or "warn_" in flag for flag in flags) or risk_score >= 55:
-            risk_level = "warn"
-        else:
-            risk_level = "normal"
-
-        return {
-            "risk_score": risk_score,
-            "risk_level": risk_level,
-            "risk_flags": flags,
-            "temp_slope_c_per_min": round(temp_slope, 2),
-            "cpu_avg_percent": round(cpu_avg, 2),
-        }
-
-
-def _get_cached_scorer(config: dict[str, Any]) -> RiskScorer:
-    key = id(config)
-    scorer = _SCORER_CACHE.get(key)
-    if scorer is None or scorer.config is not config:
-        scorer = RiskScorer(config)
-        _SCORER_CACHE[key] = scorer
-    return scorer
-
-
-def calculate_risk_score(metrics: dict[str, Any], config: dict[str, Any]) -> int:
-    scorer = _get_cached_scorer(config)
-    return int(scorer.evaluate(metrics)["risk_score"])
-
-# ===== Scheduler Compatibility Wrappers =====
-TIER_INFO     = "normal"
-TIER_WARN     = "warn"
-TIER_CRITICAL = "critical"
+# Sliding window: (timestamp, temp_c) tuples
+_temp_history: Deque = collections.deque(maxlen=60)   # ~3 min at 3s interval
 
 
 @dataclass
 class RiskResult:
-    """Wrapper result object for scheduler compatibility."""
-    score: float
-    tier: str
+    score: float = 0.0          # 0–100
+    tier: str = TIER_INFO
+    temp_slope_per_min: float = 0.0
+    components: dict = None
     reason: str = ""
 
 
-def compute(telemetry: dict[str, Any], cfg: dict[str, Any]) -> RiskResult:
-    """Compatibility wrapper that converts new scorer to old API."""
-    # Extract metrics from telemetry dict
-    metrics = {
-        "temp_c": telemetry.get("temp_c", -1.0),
-        "cpu_percent": telemetry.get("cpu_percent", 0.0),
-        "ram_percent": telemetry.get("ram_percent", 0.0),
-    }
-    
-    # Run the new scorer
-    scorer = _get_cached_scorer(cfg)
-    result = scorer.evaluate(metrics)
-    
-    # Map new format to old format
-    scored_return = RiskResult(
-        score=float(result["risk_score"]),
-        tier=result["risk_level"],
-        reason=", ".join(result.get("risk_flags", [])) or "System nominal"
+def _compute_slope() -> float:
+    """Linear regression slope of recent temperatures in °C/min."""
+    if len(_temp_history) < 4:
+        return 0.0
+    xs = [t for t, _ in _temp_history]
+    ys = [v for _, v in _temp_history]
+    x0 = xs[0]
+    xs = [x - x0 for x in xs]
+    n = len(xs)
+    sx, sy, sxy, sx2 = sum(xs), sum(ys), sum(a*b for a,b in zip(xs,ys)), sum(a**2 for a in xs)
+    denom = n * sx2 - sx * sx
+    if denom == 0:
+        return 0.0
+    slope_per_sec = (n * sxy - sx * sy) / denom
+    return slope_per_sec * 60.0   # °C per minute
+
+
+def compute(telemetry: dict, cfg: dict) -> RiskResult:
+    thresholds = cfg.get("thresholds", {})
+    weights    = cfg.get("risk_weights", {})
+
+    temp_warn     = thresholds.get("temp_warn",        75.0)
+    temp_crit     = thresholds.get("temp_critical",    88.0)
+    cpu_warn      = thresholds.get("cpu_warn",         80.0)
+    cpu_crit      = thresholds.get("cpu_critical",     95.0)
+    ram_warn      = thresholds.get("ram_warn",         85.0)
+    ram_crit      = thresholds.get("ram_critical",     95.0)
+    slope_warn    = thresholds.get("temp_slope_warn",   3.0)
+    slope_crit    = thresholds.get("temp_slope_critical", 6.0)
+
+    w_temp   = weights.get("temp_abs",       0.40)
+    w_slope  = weights.get("temp_slope",     0.25)
+    w_cpu    = weights.get("cpu_sustained",  0.25)
+    w_ram    = weights.get("ram_pressure",   0.10)
+
+    cpu_pct  = telemetry.get("cpu", {}).get("total_pct", 0.0)
+    temp_c   = telemetry.get("cpu", {}).get("temp_celsius")
+    ram_pct  = telemetry.get("memory", {}).get("ram_pct", 0.0)
+
+    # Update sliding window
+    if temp_c is not None:
+        _temp_history.append((time.monotonic(), temp_c))
+
+    slope = _compute_slope()
+
+    # Normalise each component to 0-1
+    def norm(val, warn, crit):
+        if val <= warn:
+            return (val / warn) * 0.5 if warn > 0 else 0
+        elif val >= crit:
+            return 1.0
+        else:
+            return 0.5 + 0.5 * (val - warn) / (crit - warn)
+
+    temp_norm  = norm(temp_c or 0, temp_warn, temp_crit)
+    slope_norm = norm(abs(slope), slope_warn, slope_crit)
+    cpu_norm   = norm(cpu_pct,  cpu_warn,  cpu_crit)
+    ram_norm   = norm(ram_pct,  ram_warn,  ram_crit)
+
+    score = (
+        w_temp  * temp_norm  +
+        w_slope * slope_norm +
+        w_cpu   * cpu_norm   +
+        w_ram   * ram_norm
+    ) * 100.0
+    score = min(100.0, round(score, 1))
+
+    # Tier
+    if score >= 70 or (temp_c or 0) >= temp_crit or cpu_pct >= cpu_crit:
+        tier = TIER_CRITICAL
+    elif score >= 40 or (temp_c or 0) >= temp_warn or cpu_pct >= cpu_warn:
+        tier = TIER_WARN
+    else:
+        tier = TIER_INFO
+
+    reasons = []
+    if temp_c is not None and temp_c >= temp_warn:
+        reasons.append(f"Temp {temp_c:.1f}°C")
+    if slope > slope_warn:
+        reasons.append(f"Temp rising {slope:.1f}°C/min")
+    if cpu_pct >= cpu_warn:
+        reasons.append(f"CPU {cpu_pct:.0f}%")
+    if ram_pct >= ram_warn:
+        reasons.append(f"RAM {ram_pct:.0f}%")
+
+    return RiskResult(
+        score=score,
+        tier=tier,
+        temp_slope_per_min=round(slope, 2),
+        components={
+            "temp_norm": round(temp_norm, 3),
+            "slope_norm": round(slope_norm, 3),
+            "cpu_norm": round(cpu_norm, 3),
+            "ram_norm": round(ram_norm, 3),
+        },
+        reason=", ".join(reasons) if reasons else "System nominal",
     )
-    return scored_return
