@@ -3,6 +3,7 @@ Mitigation actions for the watchdog.
 All destructive actions require allowlist check + dry_run guard.
 """
 import subprocess, logging, ctypes, psutil
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -96,3 +97,26 @@ def request_process_termination(pid: int, name: str, kill_allowlist: list, dry_r
     )
     logger.warning(f"Termination proposed for {name} ({pid}). Awaiting user confirmation.")
     return True   # Actual kill happens only via confirmed dashboard action
+
+
+def run_maintenance_script(script_path: str, dry_run: bool = False) -> bool:
+    script = Path(script_path)
+    if not script.exists():
+        logger.warning("ATS maintenance script not found: %s", script)
+        return False
+
+    if dry_run:
+        logger.info("[DRY RUN] Would run ATS maintenance script: %s", script)
+        return True
+
+    try:
+        subprocess.Popen(
+            ["cmd.exe", "/c", str(script)],
+            cwd=str(script.parent),
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+        )
+        logger.info("Started ATS maintenance script: %s", script)
+        return True
+    except Exception as exc:
+        logger.error("Failed to start ATS maintenance script %s: %s", script, exc)
+        return False

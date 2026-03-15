@@ -95,7 +95,9 @@ def get_temperature() -> tuple[Optional[float], str]:
     return None, "unavailable – install LibreHardwareMonitor"
 
 
-def get_top_processes(n: int = 10) -> List[dict]:
+def get_top_processes(n: int = 10, *, limit: Optional[int] = None) -> List[dict]:
+    if limit is not None:
+        n = limit
     procs = []
     for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent", "io_counters"]):
         try:

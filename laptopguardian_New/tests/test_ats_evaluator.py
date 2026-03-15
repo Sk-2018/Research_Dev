@@ -3,13 +3,18 @@ import unittest
 from unittest.mock import patch
 
 from app.configuration import DEFAULT_CONFIG
+from app.watchdog import ats_evaluator
 from app.watchdog.ats_evaluator import ATSSignal, evaluate
 
 
 class TestATSEvaluator(unittest.TestCase):
     def setUp(self) -> None:
         self.config = copy.deepcopy(DEFAULT_CONFIG)
-        self.telemetry = {"temp_c": 55.0}
+        ats_evaluator._last_static_eval_at = 0.0
+        ats_evaluator._last_static_signals = []
+        ats_evaluator._last_result = ats_evaluator.ATSEvalResult()
+        ats_evaluator._temp_history.clear()
+        self.telemetry = {"cpu": {"temp_celsius": 55.0}}
 
     @patch("app.watchdog.ats_evaluator.check_network_packet_loss")
     @patch("app.watchdog.ats_evaluator.check_dns_latency")
@@ -51,6 +56,17 @@ class TestATSEvaluator(unittest.TestCase):
         self.assertTrue(first.fresh_scan)
         self.assertFalse(second.fresh_scan)
         self.assertEqual(heavy_signals.call_count, 1)
+
+    @patch("app.watchdog.ats_evaluator._heavy_signals")
+    def test_evaluate_reads_nested_cpu_temperature(self, heavy_signals) -> None:
+        heavy_signals.return_value = []
+
+        first = evaluate({"cpu": {"temp_celsius": 40.0}}, self.config, force=True)
+        second = evaluate({"cpu": {"temp_celsius": 58.0}}, self.config, force=False)
+
+        trend_signal = next(signal for signal in second.signals if signal.name == "CPU Temp Trend")
+        self.assertEqual(first.verdict, "CLEAN")
+        self.assertGreaterEqual(trend_signal.value, 0.0)
 
 
 if __name__ == "__main__":

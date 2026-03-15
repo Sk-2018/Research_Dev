@@ -65,6 +65,13 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def _extract_temp_c(telemetry: dict[str, Any]) -> float:
+    cpu = telemetry.get("cpu", {})
+    if isinstance(cpu, dict):
+        return _safe_float(cpu.get("temp_celsius", telemetry.get("temp_c")), -1.0)
+    return _safe_float(telemetry.get("temp_c"), -1.0)
+
+
 def _dir_size_mb(path: str) -> float:
     total = 0
     try:
@@ -99,7 +106,7 @@ def _status(score: float) -> str:
 
 
 def _record_temp_sample(telemetry: dict[str, Any]) -> None:
-    temp_c = _safe_float(telemetry.get("temp_c"), -1.0)
+    temp_c = _extract_temp_c(telemetry)
     if temp_c <= 0:
         return
     _temp_history.append((time.time(), temp_c))
