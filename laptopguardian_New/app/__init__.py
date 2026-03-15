@@ -1,1 +1,3 @@
-__all__ = ["main"]
+"""
+Laptop Health Guardian - Health monitoring and mitigation for AMD Ryzen laptops.
+"""

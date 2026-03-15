@@ -1,225 +1,124 @@
-from __future__ import annotations
+"""
+Jarvis Agent: rule-based + optional LLM (Ollama) action proposer.
+All actions are proposals only; execution requires executor validation.
+"""
+import json, logging, requests
+from dataclasses import dataclass, field
+from typing import Optional
+from jsonschema import validate, ValidationError
 
-import json
-from typing import Any
+logger = logging.getLogger(__name__)
 
-import requests
-
-
-ALLOWED_ACTIONS = {
-    "NONE",
-    "THROTTLE_POWER",
-    "RESTORE_POWER",
-    "LOWER_PRIORITY",
-    "SUSPEND_WORKLOADS",
-    "KILL_PROCESS",
+ACTION_SCHEMA = {
+    "type": "object",
+    "required": ["action", "target", "reason", "confidence", "safety"],
+    "properties": {
+        "action":      {"type": "string", "enum": ["lower_priority", "switch_power_saver", "propose_terminate", "no_action", "notify"]},
+        "target":      {"type": "string"},
+        "reason":      {"type": "string"},
+        "confidence":  {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "safety": {
+            "type": "object",
+            "required": ["requires_confirmation"],
+            "properties": {
+                "requires_confirmation": {"type": "boolean"},
+                "is_destructive":        {"type": "boolean"},
+            }
+        }
+    }
 }
 
 
-def _with_meta(
-    decision: dict[str, Any],
-    *,
-    source: str,
-    llm_requested: bool,
-    llm_used: bool,
-    fallback_used: bool,
-    llm_error: str = "",
-) -> dict[str, Any]:
-    enriched = dict(decision)
-    enriched["meta"] = {
-        "decision_source": source,
-        "llm_requested": bool(llm_requested),
-        "llm_used": bool(llm_used),
-        "fallback_used": bool(fallback_used),
-        "llm_error": str(llm_error or ""),
-    }
-    return enriched
+def validate_action(proposal: dict) -> bool:
+    try:
+        validate(instance=proposal, schema=ACTION_SCHEMA)
+        return True
+    except ValidationError as e:
+        logger.error(f"Action schema validation failed: {e.message}")
+        return False
 
 
-def _canonical_name(name: str) -> str:
-    value = (name or "").strip().lower()
-    if value.endswith(".exe"):
-        return value[:-4]
-    return value
+def _rule_based_propose(telemetry: dict, cfg: dict) -> dict:
+    """Deterministic rule-based fallback when no LLM is available."""
+    cpu_pct   = telemetry.get("cpu", {}).get("total_pct", 0)
+    temp_c    = telemetry.get("cpu", {}).get("temp_celsius") or 0
+    thresholds = cfg.get("thresholds", {})
+    procs = telemetry.get("cpu", {}).get("top_processes", [])
+    top_proc = procs[0]["name"] if procs else "unknown"
 
-
-def _safe_json_loads(value: Any) -> Any:
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return None
-    return value
-
-
-def normalize_decision(raw_decision: Any) -> dict[str, Any]:
-    loaded = _safe_json_loads(raw_decision)
-    if not isinstance(loaded, dict):
+    if temp_c >= thresholds.get("temp_critical", 88):
         return {
-            "action": "NONE",
-            "target": "",
-            "reason": "Decision format invalid",
-            "safety": {"requires_confirmation": False},
+            "action": "propose_terminate",
+            "target": top_proc,
+            "reason": f"Temperature critical at {temp_c:.1f}°C; top CPU consumer is {top_proc}.",
+            "confidence": 0.85,
+            "safety": {"requires_confirmation": True, "is_destructive": True}
         }
-
-    action = str(loaded.get("action", "NONE")).strip().upper()
-    if action not in ALLOWED_ACTIONS:
-        action = "NONE"
-
-    target = str(loaded.get("target", "")).strip()
-    reason = str(loaded.get("reason", "No reason")).strip() or "No reason"
-    safety = loaded.get("safety")
-    if not isinstance(safety, dict):
-        safety = {"requires_confirmation": False}
-    else:
-        safety = {"requires_confirmation": bool(safety.get("requires_confirmation", False))}
-
+    elif cpu_pct >= thresholds.get("cpu_warn", 80):
+        return {
+            "action": "lower_priority",
+            "target": top_proc,
+            "reason": f"CPU at {cpu_pct:.1f}%; lowering priority of {top_proc} to reduce heat.",
+            "confidence": 0.90,
+            "safety": {"requires_confirmation": False, "is_destructive": False}
+        }
+    elif temp_c >= thresholds.get("temp_warn", 75):
+        return {
+            "action": "switch_power_saver",
+            "target": "system",
+            "reason": f"Temperature elevated at {temp_c:.1f}°C; switching to power saver.",
+            "confidence": 0.92,
+            "safety": {"requires_confirmation": False, "is_destructive": False}
+        }
     return {
-        "action": action,
-        "target": target,
-        "reason": reason,
-        "safety": safety,
+        "action": "no_action",
+        "target": "system",
+        "reason": "System nominal.",
+        "confidence": 0.99,
+        "safety": {"requires_confirmation": False, "is_destructive": False}
     }
 
 
-def _pick_top_allowed_process(snapshot: dict[str, Any], allowlist: list[str]) -> str:
-    allow = {_canonical_name(name) for name in allowlist}
-    top_processes = snapshot.get("top_processes", [])
-    if not isinstance(top_processes, list):
-        return ""
-    for proc in top_processes:
-        if not isinstance(proc, dict):
-            continue
-        name = str(proc.get("name", "")).strip()
-        if not name:
-            continue
-        if allow and _canonical_name(name) not in allow:
-            continue
-        return name
-    return ""
+def _llm_propose(telemetry: dict, cfg: dict) -> Optional[dict]:
+    agent_cfg  = cfg.get("agent", {})
+    url        = agent_cfg.get("ollama_url", "http://localhost:11434/api/generate")
+    model      = agent_cfg.get("ollama_model", "mistral")
+    cpu_pct    = telemetry.get("cpu", {}).get("total_pct", 0)
+    temp_c     = telemetry.get("cpu", {}).get("temp_celsius")
+    ram_pct    = telemetry.get("memory", {}).get("ram_pct", 0)
 
+    prompt = f"""You are a laptop thermal management agent for an AMD Ryzen 7 5700U laptop.
+Current metrics: CPU={cpu_pct:.1f}%, Temp={temp_c}°C, RAM={ram_pct:.1f}%.
+Top processes: {telemetry.get('cpu', {}).get('top_processes', [])[:3]}
 
-def rule_based_decision(snapshot: dict[str, Any], assessment: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    actions = config["actions"]
-    allowlist = config["process_allowlist"]
-    risk_level = str(assessment.get("risk_level", "normal")).lower()
-    flags = assessment.get("risk_flags", [])
-    if not isinstance(flags, list):
-        flags = []
-
-    if risk_level == "critical":
-        if actions.get("suspend_workloads_on_critical", False):
-            candidate = _pick_top_allowed_process(snapshot, allowlist.get("kill_candidates", []))
-            if candidate:
-                return {
-                    "action": "SUSPEND_WORKLOADS",
-                    "target": candidate,
-                    "reason": "Critical risk with allowed workload candidate",
-                    "safety": {"requires_confirmation": False},
-                }
-        if actions.get("switch_power_saver_on_warn", True):
-            return {
-                "action": "THROTTLE_POWER",
-                "target": "system",
-                "reason": f"Critical risk flags: {','.join(flags) if flags else 'n/a'}",
-                "safety": {"requires_confirmation": False},
-            }
-
-    if risk_level == "warn":
-        if actions.get("lower_process_priority_on_warn", True):
-            candidate = _pick_top_allowed_process(snapshot, allowlist.get("priority_lower", []))
-            if candidate:
-                return {
-                    "action": "LOWER_PRIORITY",
-                    "target": candidate,
-                    "reason": "Warning risk with high CPU workload",
-                    "safety": {"requires_confirmation": False},
-                }
-        if actions.get("switch_power_saver_on_warn", True):
-            return {
-                "action": "THROTTLE_POWER",
-                "target": "system",
-                "reason": "Warning risk threshold reached",
-                "safety": {"requires_confirmation": False},
-            }
-
-    return {
-        "action": "NONE",
-        "target": "",
-        "reason": "No action required",
-        "safety": {"requires_confirmation": False},
-    }
-
-
-def ask_jarvis(snapshot: dict[str, Any], assessment: dict[str, Any], config: dict[str, Any], logger: Any = None) -> dict[str, Any]:
-    agent_cfg = config["agent"]
-    if not agent_cfg.get("enabled", False) or not agent_cfg.get("use_llm", False):
-        return _with_meta(
-            rule_based_decision(snapshot, assessment, config),
-            source="rule_based_policy",
-            llm_requested=False,
-            llm_used=False,
-            fallback_used=False,
-        )
-
-    prompt = (
-        "You are a Windows system safety controller.\n"
-        f"Snapshot: {json.dumps(snapshot)}\n"
-        f"Assessment: {json.dumps(assessment)}\n"
-        "Return ONLY JSON: "
-        '{"action":"NONE|THROTTLE_POWER|RESTORE_POWER|LOWER_PRIORITY|SUSPEND_WORKLOADS|KILL_PROCESS","target":"","reason":"","safety":{"requires_confirmation":false}}'
-    )
+Respond ONLY with valid JSON matching this schema exactly (no extra text):
+{{"action": "<lower_priority|switch_power_saver|propose_terminate|no_action|notify>",
+  "target": "<process_name_or_system>",
+  "reason": "<concise explanation>",
+  "confidence": <0.0-1.0>,
+  "safety": {{"requires_confirmation": <true|false>, "is_destructive": <true|false>}}}}"""
 
     try:
-        response = requests.post(
-            str(agent_cfg["ollama_url"]),
-            json={
-                "model": str(agent_cfg["ollama_model"]),
-                "prompt": prompt,
-                "stream": False,
-                "format": "json",
-            },
-            timeout=6,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        decision = normalize_decision(payload.get("response", payload))
-        if decision["action"] == "NONE" and agent_cfg.get("rule_based_fallback", True):
-            fallback = rule_based_decision(snapshot, assessment, config)
-            fallback["reason"] = f"LLM returned no-op, fallback: {fallback['reason']}"
-            return _with_meta(
-                fallback,
-                source="rule_based_fallback_noop",
-                llm_requested=True,
-                llm_used=False,
-                fallback_used=True,
-            )
-        return _with_meta(
-            decision,
-            source="llm",
-            llm_requested=True,
-            llm_used=True,
-            fallback_used=False,
-        )
-    except Exception as exc:
-        if logger:
-            logger.warning("Jarvis LLM request failed: %s", exc)
-        if agent_cfg.get("rule_based_fallback", True):
-            fallback = rule_based_decision(snapshot, assessment, config)
-            fallback["reason"] = f"LLM fallback: {fallback['reason']}"
-            return _with_meta(
-                fallback,
-                source="rule_based_fallback_error",
-                llm_requested=True,
-                llm_used=False,
-                fallback_used=True,
-                llm_error=str(exc),
-            )
-        return _with_meta(
-            normalize_decision(None),
-            source="llm_error_no_fallback",
-            llm_requested=True,
-            llm_used=False,
-            fallback_used=False,
-            llm_error=str(exc),
-        )
+        r = requests.post(url, json={"model": model, "prompt": prompt, "stream": False}, timeout=15)
+        r.raise_for_status()
+        text = r.json().get("response", "")
+        # Extract JSON from response
+        start = text.find("{")
+        end   = text.rfind("}") + 1
+        proposal = json.loads(text[start:end])
+        if validate_action(proposal):
+            return proposal
+    except Exception as e:
+        logger.warning(f"LLM query failed: {e}; falling back to rules.")
+    return None
+
+
+def propose(telemetry: dict, cfg: dict) -> dict:
+    agent_cfg = cfg.get("agent", {})
+    if not agent_cfg.get("enabled", False):
+        return _rule_based_propose(telemetry, cfg)
+    if agent_cfg.get("use_llm", False):
+        proposal = _llm_propose(telemetry, cfg)
+        if proposal:
+            return proposal
+    return _rule_based_propose(telemetry, cfg)
